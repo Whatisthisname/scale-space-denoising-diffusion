@@ -5,3 +5,5 @@ mnist_data
 __pycache__
 synthesized
 previews/*.png
+.venv
+

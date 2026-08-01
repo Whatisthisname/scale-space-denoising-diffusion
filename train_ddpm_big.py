@@ -1,4 +1,6 @@
 import matplotlib
+
+matplotlib.use("Agg")
 import torch
 import torch.nn as nn
 from torchvision.datasets import MNIST
@@ -6,19 +8,17 @@ import torchvision
 import argparse
 import torch_ema as ema
 import sys
-sys.path.insert(0, '../models/')
+
+sys.path.insert(0, "../models/")
 from models.DDPM_big import DDPM_big
 import tqdm
 
-from utils import create_mnist_dataloaders
+from utils import create_mnist_tensor_loaders, denormalize_images, pick_device
 
 
 import glob
 import os
 import re
-
-
-
 
 
 def parse_args():
@@ -42,13 +42,21 @@ def parse_args():
     parser.add_argument("--run_name", type=str, help="define run name", required=True)
     parser.add_argument("--img_size", type=int, help="size of image", default="28")
     parser.add_argument("--early_stop", type=int, help="early stop", default=1000)
-    
+
     # add flag to toggle loading latest checkpoint automatically
     parser.add_argument("--ckpt", action="store_true", help="load latest checkpoint")
 
     # timesteps argument
     parser.add_argument("--markov_states", type=int, help="sampling steps of DDPM", default=50)
     parser.add_argument("--noise_power", type=float, help="noise power of DDPM", default=1.5)
+
+    parser.add_argument("--device", type=str, default="auto", help="auto, cuda, mps or cpu")
+    parser.add_argument(
+        "--preview_every",
+        type=int,
+        default=1,
+        help="write sample GIFs/PNGs every N epochs. 0 disables previews entirely.",
+    )
 
     args = parser.parse_args()
 
@@ -57,24 +65,30 @@ def parse_args():
 
 def main(args):
     print("Saving images to {}".format(args.run_name))
-    
+
+    device = pick_device(args.device)
+    print("Training on {}".format(device))
+
     model = DDPM_big(
-        args.img_size, ctx_sz=1+10, markov_states=args.markov_states, unet_stages=args.unet_stages, noise_schedule_param=args.noise_power)
-    
+        args.img_size,
+        ctx_sz=1 + 10,
+        markov_states=args.markov_states,
+        unet_stages=args.unet_stages,
+        noise_schedule_param=args.noise_power,
+        device=device,
+    )
+
     # ema_model = ema.ExponentialMovingAverage(small_model.parameters(), decay=0.95)
 
-    
-
-    train_dataloader, test_dataloader = create_mnist_dataloaders(
-        batch_size=args.batch_size, image_size=args.img_size
+    train_dataloader, test_dataloader = create_mnist_tensor_loaders(
+        batch_size=args.batch_size, image_size=args.img_size, device=device
     )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
-
 
     def from_scratch():
         # remove existing run name directory with checkpoints and images
         import shutil
+
         shutil.rmtree("images/{}".format(args.run_name), ignore_errors=True)
         shutil.rmtree("checkpoints/{}".format(args.run_name), ignore_errors=True)
 
@@ -99,17 +113,16 @@ def main(args):
         os.makedirs("images/schedules", exist_ok=True)
 
         torchvision.utils.save_image(
-            images,
+            denormalize_images(images, args.img_size),
             "checkpoints/{}/forward.png".format(args.run_name),
             nrow=20,
         )
-
 
     loaded_epoch = 0
     if args.ckpt:
         # load latest checkpoint from checkpoint folder
         # find the latest checkpoint in the checkpoints/run_name folder
-        
+
         checkpoints = glob.glob("checkpoints/{}/*.pth".format(args.run_name))
         if len(checkpoints) == 0:
             print("No checkpoints found, starting from scratch")
@@ -124,7 +137,6 @@ def main(args):
     else:
         print("No checkpoint loaded, starting from scratch")
         from_scratch()
-        
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -133,11 +145,12 @@ def main(args):
     os.makedirs("checkpoints/{}".format(args.run_name), exist_ok=True)
 
     for epoch in range(loaded_epoch, loaded_epoch + args.epochs):
-        
+
         with tqdm.tqdm(train_dataloader) as loader:
-                
+
             total_loss = 0
-            
+            model.train()
+
             for i, (images, labels) in enumerate(loader):
                 if i > args.early_stop:
                     break
@@ -146,20 +159,19 @@ def main(args):
                 labels = labels.to(device)
 
                 optimizer.zero_grad()
-                loss = model.train(images, labels)
+                loss = model.training_loss(images, labels)
                 loss.backward()
                 optimizer.step()
 
                 total_loss += float(loss.item())
 
                 # Description will be displayed on the left
-                loader.set_description('E%i' % (epoch + 1))
+                loader.set_description("E%i" % (epoch + 1))
                 # Postfix will be displayed on the right,
                 loader.set_postfix(avg_loss=total_loss / (i + 1))
 
                 # if i % args.ema_update_freq == 0:
                 #     ema_model.update()
-
 
             # after epoch, save model checkpoint:
             torch.save(
@@ -167,23 +179,35 @@ def main(args):
                 "checkpoints/{}/model_{}.pth".format(args.run_name, epoch),
             )
 
+            if args.preview_every <= 0 or (epoch + 1) % args.preview_every != 0:
+                continue
+
+            # BatchNorm must use running statistics here, otherwise a sample depends on
+            # whatever else happens to share its batch.
+            model.eval()
+
             # after each epoch, sample one batch of images
             with torch.no_grad():
-            # with ema_model.average_parameters():
+                # with ema_model.average_parameters():
                 # break
                 # print("sampling")
                 # target_label = torch.randint(0, 10, (args.n_samples,)).tolist()
                 # images = small_model.sample(20, [0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9], return_whole_process=True)
                 sample_data = next(iter(test_dataloader))
-                input_images =sample_data[0][:args.n_samples].to(device)
-                input_labels = torch.Tensor(sample_data[1][:args.n_samples].tolist()).to(device) # * 0 # remove labels
-                
-                condition_images = torch.nn.functional.interpolate(input_images, size=(args.img_size // 2, args.img_size // 2), mode="bilinear", align_corners=False)
-                condition_images : torch.Tensor = torch.nn.functional.interpolate(condition_images, size=(args.img_size, args.img_size), mode="bilinear", align_corners=False).to(device)
+                input_images = sample_data[0][: args.n_samples].to(device)
+                input_labels = torch.Tensor(sample_data[1][: args.n_samples].tolist()).to(device)  # * 0 # remove labels
+
+                condition_images = torch.nn.functional.interpolate(
+                    input_images, size=(args.img_size // 2, args.img_size // 2), mode="bilinear", align_corners=False
+                )
+                condition_images: torch.Tensor = torch.nn.functional.interpolate(
+                    condition_images, size=(args.img_size, args.img_size), mode="bilinear", align_corners=False
+                ).to(device)
 
                 if True:
-                    reverse_images = model.sample(args.n_samples, input_labels, condition_images, keep_intermediate=True).cpu()
-                    
+                    reverse_images = model.sample(
+                        args.n_samples, input_labels, condition_images, keep_intermediate=True
+                    ).cpu()
 
                     min_max = [(x.min().item(), x.max().item()) for x in reverse_images.unbind(dim=1)]
 
@@ -202,27 +226,32 @@ def main(args):
 
                     fig = plt.figure()
                     ims = []
-                    for (min, max), i in zip(min_max, range(args.markov_states-1)):
+                    for (min, max), i in zip(min_max, range(args.markov_states - 1)):
                         im = plt.imshow(frames[i].squeeze(), vmin=min, vmax=max, cmap="gray")
                         ims.append([im])
-                    for i in range(10): # repeat the last frame 10 times
+                    for i in range(10):  # repeat the last frame 10 times
                         im = plt.imshow(frames[-1].squeeze(), vmin=min, vmax=max, cmap="gray")
                         ims.append([im])
-                    
-                    ani = animation.ArtistAnimation(fig, ims, interval=100, blit=True, repeat_delay=100)
-                    
-                    ani.save("images/{}/model_samples_{}.gif".format(args.run_name, epoch), writer=matplotlib.animation.PillowWriter(fps=10))
 
-    
-                if True: # show each insta-prediction besides the normal reverse process
+                    ani = animation.ArtistAnimation(fig, ims, interval=100, blit=True, repeat_delay=100)
+
+                    ani.save(
+                        "images/{}/model_samples_{}.gif".format(args.run_name, epoch),
+                        writer=matplotlib.animation.PillowWriter(fps=10),
+                    )
+                    plt.close(fig)
+
+                if True:  # show each insta-prediction besides the normal reverse process
                     amount = args.n_samples // 4
                     labels = input_labels[:amount]
-                    reverse_images = model.sample(amount, labels, condition_images[: amount], keep_intermediate=True)
+                    reverse_images = model.sample(amount, labels, condition_images[:amount], keep_intermediate=True)
 
                     # reverse images is a (amount, markov_states, 1, img_size, img_size) tensor.
 
                     t = torch.Tensor([i for i in reversed(range(args.markov_states))]).to(device).long()
-                    labels = labels.repeat((args.markov_states)).to(device).long()
+                    # reverse_flattened is ordered sample-major, so labels repeat per sample
+                    # while timesteps cycle within each sample.
+                    labels = labels.repeat_interleave(args.markov_states).to(device).long()
                     cond_images = condition_images[:amount].repeat_interleave(args.markov_states, dim=0).to(device)
                     t = t.repeat((amount)).to(device).long()
 
@@ -231,7 +260,7 @@ def main(args):
 
                     # join the images together along horizontal axis
                     joined = torch.cat((reverse_flattened.cpu(), insta_predictions.cpu()), dim=3)
-                    
+                    joined = denormalize_images(joined, args.img_size)
 
                     # now join the images together along the vertical axis
                     joined = torch.unbind(joined, dim=0)
@@ -259,8 +288,6 @@ def main(args):
                 #                 # images = forward_images
                 # save the images to the run_name path
                 # stack the images and the predictions together and save them in one image
-
-                
 
 
 if __name__ == "__main__":
